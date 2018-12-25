@@ -37,6 +37,7 @@ def get_corpus(if_segment = False,set_no = 0):#返回句子，二维列表
 #    stop_dir = param.get_stop_dir()
 #    stopwords = [line.strip() for line in (open(stop_dir, 'r', encoding='utf-8')).readlines()]
     stopwords = ['@','#','、','~','♡','“','”']
+    allowed_words = ['.',',','?','!','\\','-','n',';']
     songlist = os.listdir(dir)
     try:
         songlist.remove('vocab.json')
@@ -61,6 +62,9 @@ def get_corpus(if_segment = False,set_no = 0):#返回句子，二维列表
     pattern5 = re.compile(r'…+')
     pattern6 = re.compile(r'\\r')
     pattern7 = re.compile('[0-9]+')
+    pattern8 = re.compile(r',+')
+
+
 #    pattern7 = re.compile(r'。+')
     for name in songlist:
         songdir = dir + '/' + name
@@ -73,9 +77,8 @@ def get_corpus(if_segment = False,set_no = 0):#返回句子，二维列表
                 text = [pattern4.sub(",", lines) for lines in text]#去掉空格
                 text = [pattern5.sub(".", lines) for lines in text]#去掉…
                 text = [pattern6.sub("", lines) for lines in text]#去掉空格\r
-                text = [pattern7.sub('/num', lines) for lines in text]  # 数字变成 \num
-                #               text = [pattern7.sub("。", lines) for lines in text]  # 去掉。。。
-
+                text = [pattern7.sub("n", lines) for lines in text] #用n代表数字
+                text = [pattern8.sub(",", lines) for lines in text]  # 去掉,,,
 
                 for sentance in text:
                     sentance_seg = []
@@ -89,9 +92,8 @@ def get_corpus(if_segment = False,set_no = 0):#返回句子，二维列表
                         sentance_seg = sentance
                     sentance_seg2= ['\start']
                     for word in sentance_seg:
-                        if word not in stopwords:
+                        if word in allowed_words or is_chinese(word):
                             sentance_seg2.append(word)
- #                           sentance_seg2.append(word)
                     sentance_seg2.append('\end')
                     if len(sentance_seg2) > 15:
                         corpus.append(sentance_seg2)

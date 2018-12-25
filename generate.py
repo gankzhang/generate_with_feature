@@ -15,7 +15,7 @@ data_dir = param.get_data_dir()
 save_dir = param.get_save_dir()
 _NUM_UNITS = param.get_embed_dim()#输入宽度
 _NUM_LAYERS = 2
-BATCH_SIZE = 16
+BATCH_SIZE = 20
 if_segment = param.if_segment()
 
 stop_dir = param.get_stop_dir()
@@ -46,8 +46,6 @@ def get_arguments():
     return parser.parse_args()
 
 
-
-
 class Generator:
     def __init__(self):
         keep_prob = 0.8# dropout
@@ -55,57 +53,71 @@ class Generator:
         VOCAB_SIZE = len(self.int2ch)
         self.learn_rate = tf.Variable(0.0, trainable = False)
         with tf.variable_scope('cell',initializer=tf.contrib.layers.xavier_initializer()):
+            self.encoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
+            self.encoder_init_state = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
+            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None,_NUM_UNITS])
+            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
+            _, self.encoder_final_state = tf.nn.dynamic_rnn(
+                cell=self.encoder_cell,
+                initial_state=self.encoder_init_state,
+                inputs=self.encoder_inputs,
+                sequence_length=self.encoder_lengths,
+                scope='encoder')
+
             # embedding 层
             self.embedding = tf.get_variable(name = 'embedding',shape=[VOCAB_SIZE, _NUM_UNITS],trainable = True,
                                              initializer=tf.contrib.layers.xavier_initializer())
             self._embed_ph = tf.placeholder(tf.float32, [VOCAB_SIZE, _NUM_UNITS])
             self._embed_init = self.embedding.assign(self._embed_ph)
 
+#            self.decoder_cell = rnn.MultiRNNCell([rnn.GRUCell(_NUM_UNITS)] * _NUM_LAYERS)
+#            self.initial_state = tf.placeholder(tf.float32, [_NUM_LAYERS * _NUM_UNITS * 2])
             self.decoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
-            self.decoder_cell_drop = tf.contrib.rnn.DropoutWrapper(self.decoder_cell, output_keep_prob=keep_prob,)
-#            self.decoder_init_state = tf.placeholder(tf.float32, [BATCH_SIZE, None])
-#           self.decoder_init_state = tf.zeros(tf.float32,[BATCH_SIZE, _NUM_UNITS])
-
-            self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
-#           self.decoder_init_state = tf.placeholder(tf.float32, [BATCH_SIZE,_NUM_UNITS])
+            self.decoder_cell_drop = tf.contrib.rnn.DropoutWrapper(self.decoder_cell, output_keep_prob=keep_prob)
+#            self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
+#            self.decoder_init_state = self.decoder_cell_drop.get_initial_state(self.initial_state,BATCH_SIZE,dtype=tf.float32)
 
             self.decoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
             self.decoder_inputs = tf.placeholder(tf.int32, [BATCH_SIZE, None])
-            outputs, self.decoder_final_state = tf.nn.dynamic_rnn(
+            self.outputs, self.decoder_final_state = tf.nn.dynamic_rnn(
                 cell = self.decoder_cell_drop,
-                initial_state = self.decoder_init_state,#初始状态,h
+                initial_state = self.encoder_final_state,#初始状态,h
                 inputs = tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),#输入x
                 sequence_length = self.decoder_lengths,
                 dtype = tf.float32,
                 scope = 'decoder')
 
         #这里直接用softmax
-#        with tf.variable_scope('decoder'):
-#            self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
-#            self.softmax_b = tf.get_variable('softmax_b', [VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
+        with tf.variable_scope('decoder'):
+            self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
+            self.softmax_b = tf.get_variable('softmax_b', [VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
 
-        self.logits = tf.contrib.layers.fully_connected(outputs, VOCAB_SIZE, activation_fn=None,
-#                                                   weights_initializer=tf.truncated_normal_initializer(stddev=0.1),
-                                                    weights_initializer = tf.glorot_uniform_initializer(),
-                                                   biases_initializer=tf.zeros_initializer())
-
-#        self.logits = tf.nn.bias_add(tf.matmul(tf.reshape(outputs, [_BATCH_SIZE, _NUM_UNITS]), self.softmax_w),
-#                bias = self.softmax_b)
-        self.probs = tf.nn.softmax(self.logits)#相当于一个全连接层了，输出应该是一个one_shot向量
-
+        self.logits = tf.nn.bias_add(tf.matmul(tf.reshape(self.outputs, [-1, _NUM_UNITS]), self.softmax_w),
+                bias = self.softmax_b)
+        self.probs = tf.reshape(tf.nn.softmax(self.logits), [BATCH_SIZE,-1,VOCAB_SIZE])#输出应该是一个one_shot向量
         self.targets = tf.placeholder(tf.int32, [BATCH_SIZE, None])#训练用
         self.labels = tf.one_hot(self.targets, depth = VOCAB_SIZE,dtype=tf.int32)
+        self.logits = tf.reshape(self.logits, [BATCH_SIZE,-1,VOCAB_SIZE])
+
+        temp_len_labels = []
+        temp_len_logits = []
+        for i in range(BATCH_SIZE):
+            temp_len_labels.append(self.labels[0,0:self.decoder_lengths[i],:])
+            temp_len_logits.append(self.logits[0, 0:self.decoder_lengths[i], :])
+        self.logits_2 = tf.concat(temp_len_logits,0)
+        self.labels = tf.concat(temp_len_labels,0)
+
         loss = tf.nn.softmax_cross_entropy_with_logits(
-                logits = self.probs,
+                logits = self.logits_2,
                 labels = self.labels)
         self.loss = tf.reduce_mean(loss)
-#        self.train_op = tf.train.AdamOptimizer(self.learn_rate).minimize(self.loss,)
 
         # 裁剪一下Gradient输出，最后的gradient都在[-1, 1]的范围内
         self.opt_op = tf.train.AdamOptimizer(self.learn_rate)
         self.gradients = self.opt_op.compute_gradients(self.loss)#TODO : add var_list for different lr
+        # 修建gradient
         self.capped_gradients = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in self.gradients if grad is not None]
-        self.train_op = self.opt_op.apply_gradients(self.capped_gradients)#修建gradient
+        self.train_op = self.opt_op.apply_gradients(self.capped_gradients)
 
 
 
@@ -116,24 +128,30 @@ class Generator:
 
 
     def get_batches(self, batch_size,set_no,padding_num = 0,feature_dict = dict()):
-        total_text,song_names = get_corpus(if_segment= if_segment,set_no = set_no)
+        if set_no == 4:
+            total_text, song_names = get_corpus(if_segment=if_segment, set_no=1)
+            total_text = total_text[0:1000]
+            song_names = song_names[0:1000]
+        else:
+            total_text,song_names = get_corpus(if_segment= if_segment,set_no = set_no)
+
         n_batches = (len(total_text) // (batch_size))
         batches = []
         length = []
         features = []
         songnames = []
 
-        total_length = len(total_text)
-        temp_rand_num = np.random.randint(1, 1000000, total_length)
-        temp_rank = np.argsort(temp_rand_num)
-        new_text = []
-        new_names = []
-        for i in temp_rank:
-            new_text.append(total_text[i])
-            new_names.append(song_names[i])
-        total_text = new_text
-        song_names = new_names
-        #        random.shuffle(total_text)
+        if set_no != 4:# random.shuffle
+            total_length = len(total_text)
+            temp_rand_num = np.random.randint(1, 1000000, total_length)
+            temp_rank = np.argsort(temp_rand_num)#打乱
+            new_text = []
+            new_names = []
+            for i in temp_rank:
+                new_text.append(total_text[i])
+                new_names.append(song_names[i])
+            total_text = new_text
+            song_names = new_names
         for text_i,text in enumerate(total_text):
             for word_i,word in enumerate(text):
                 total_text[text_i][word_i] = self.ch2int[total_text[text_i][word_i]]
@@ -148,9 +166,10 @@ class Generator:
             for text_i,text in enumerate(total_text[batch_i*batch_size : (batch_i+1)*batch_size]):
                 text_length = len(text)
                 for zero_i in range(text_length ,max_length[batch_i]):
-                    total_text[batch_i * batch_size + text_i].append(0)#调节为等长度，以便化为array
-                    #这里填某个使得onehot向量为全0的数，需要保证4000在词典以外。
+                    total_text[batch_i * batch_size + text_i].append(3)#调节为等长度，以便化为array
+                    #
             batches.append(np.array(total_text[batch_i * batch_size:(batch_i + 1) * (batch_size)]))
+
             temp_feature = []
             for j in range(batch_size):
                 temp_feature.append(feature_dict[song_names[batch_i * batch_size + j]])
@@ -165,11 +184,9 @@ class Generator:
         target_batch = batch.copy()
         for i in range(BATCH_SIZE):
             for j in range(length[i], batch.shape[-1]):
-                target_batch[i][j] = -1
+                target_batch[i][j] = 3
         return target_batch
     def train(self,n_epochs = 100):
-
-
         learn_rate = args.lr
         decay_rate = args.decay_rate
         replace_decay = args.replace_decay
@@ -178,11 +195,8 @@ class Generator:
 
         print("Start training RNN enc-dec model ...")
         embedding = np.load(os.path.join(data_dir,'word2vec.npy'))
-
         with tf.Session() as sess:
-
-            state = sess.run(generator.decoder_init_state)
-
+            writer = tf.summary.FileWriter("logs/", sess.graph)
             saver = tf.train.Saver()
             self._init_vars(sess)
             saved_global_step = load(saver, sess, save_dir)
@@ -191,36 +205,42 @@ class Generator:
                 # therefore we put -1 here for new or overwritten trainings.
                 saved_global_step = -1
             try:
-                #train
                 feature_dict = get_audio_feature()
                 for epoch in range(saved_global_step + 1,n_epochs):
                     log = open("log.txt", "a+")
                     replace_prob = 1 - replace_decay ** epoch
                     batches, length,features,_ = self.get_batches(batch_size=BATCH_SIZE, set_no=1,feature_dict=feature_dict)
-
                     sess.run(tf.assign(self.learn_rate, learn_rate * decay_rate ** (epoch//5*5)))
                     total_loss = 0
                     temp_total_loss = 0
                     for batch_i,batch in enumerate(batches):
-                        for ii in range(1):
-                            for jj in range(1):
-                                for kk in range(BATCH_SIZE):
-                                    state[ii][jj][kk] = \
-                                        features[batch_i][kk][ii * _NUM_UNITS:(ii+1) * _NUM_UNITS]
                         replaced_batch = self.replace(sess,batch,length[batch_i],replace_prob)
                         target_batch = self.get_target_batch(batch,length[batch_i])
-
+                        feature_batch = features[batch_i]
+                        feature_length = []
+                        for i in range(BATCH_SIZE):
+                            temp_length = feature_batch[i].shape[0] // (_NUM_UNITS*10) * (_NUM_UNITS*10)
+                            feature_batch[i] = np.reshape(feature_batch[i][:temp_length],[10,-1,_NUM_UNITS])
+                            feature_batch[i] = np.mean(feature_batch[i],0)
+                            feature_length.append(feature_batch[i].shape[0])
+                        temp_max_length = np.max(feature_length)
+                        temp_feature_batch = np.zeros([BATCH_SIZE,temp_max_length,_NUM_UNITS])
+                        for i in range(BATCH_SIZE):
+                            temp_feature_batch[i,0:feature_batch[i].shape[0],:] = feature_batch[i]
+                        feature_batch =temp_feature_batch
+                        feature_length = np.array(feature_length)
                         outputs, loss,_ = sess.run([self.decoder_final_state, self.loss, self.train_op], feed_dict={
-                            self.decoder_init_state:state,
-                            self.decoder_inputs: replaced_batch[:,:-1],
+                            self.encoder_inputs:feature_batch,
+                            self.encoder_lengths:feature_length,
+                            self.decoder_inputs:replaced_batch[:,:-1],
                             self.targets: target_batch[:,1:],
                             self.decoder_lengths:length[batch_i],
                             self._embed_ph: embedding})
                         total_loss += loss
-                        if batch_i%10 == 0:
+                        if batch_i  %  10 == 9:
                             print('Epoch {:>3} Batch {:>4}/{}   train_loss = {:.3f} range_loss = {:.3f}'.format(
                                 epoch,
-                                batch_i,
+                                batch_i + 1,
                                 len(batches),
                                 loss,
                                 total_loss - temp_total_loss))
@@ -241,22 +261,30 @@ class Generator:
                     last_train_loss = total_loss
                     print(time.ctime())
                     log.write(time.ctime()+'\n')
-
-
                     #valid
                     batches, length,features,_ = self.get_batches(BATCH_SIZE, set_no=2,feature_dict = get_audio_feature())
                     total_valid_loss = 0
                     total_valid_times = 0
                     for batch_i, batch in enumerate(batches):
 
-                        for ii in range(1):
-                            for jj in range(1):
-                                for kk in range(BATCH_SIZE):
-                                    state[ii][jj][kk] = \
-                                        features[batch_i][kk][ii * _NUM_UNITS:(ii+1) * _NUM_UNITS]
+                        feature_batch = features[batch_i]
+                        feature_length = []
+                        for i in range(BATCH_SIZE):
+                            temp_length = feature_batch[i].shape[0] // (_NUM_UNITS*10) * (_NUM_UNITS*10)
+                            feature_batch[i] = np.reshape(feature_batch[i][:temp_length],[10,-1,_NUM_UNITS])
+                            feature_batch[i] = np.mean(feature_batch[i],0)
+                            feature_length.append(feature_batch[i].shape[0])
+                        temp_max_length = np.max(feature_length)
+                        temp_feature_batch = np.zeros([BATCH_SIZE,temp_max_length,_NUM_UNITS])
+                        for i in range(BATCH_SIZE):
+                            temp_feature_batch[i,0:feature_batch[i].shape[0],:] = feature_batch[i]
+                        feature_batch =temp_feature_batch
+                        feature_length = np.array(feature_length)
+
                         target_batch = self.get_target_batch(batch,length[batch_i])
                         outputs, loss = sess.run([self.decoder_final_state, self.loss], feed_dict={
-                            self.decoder_init_state: state,
+                            self.encoder_inputs: feature_batch,
+                            self.encoder_lengths: feature_length,
                             self.decoder_inputs: batch[:, :-1],
                             self.targets: target_batch[:, 1:],
                             self.decoder_lengths: length[batch_i],
@@ -270,30 +298,29 @@ class Generator:
                                                                                   total_valid_loss-last_valid_loss,
                                                                                   total_valid_loss/total_valid_times))
                     last_valid_loss = total_valid_loss
-
                     #save
                     if epoch % 5 == 0:
                         save(saver, sess, save_dir, epoch)
                         last_saved_epoch = epoch
                         print('Model Trained and Saved')
-                        self.generate(1)
+#                        self.generate(1)
                     log.close()
             except KeyboardInterrupt:
                 print("\nTraining is interrupted.")
 
 
-    def generate(self,num = None,start_word = 10,write_json = False):
-        saver = tf.train.Saver()
+    def generate(self,num = None,start_word = 5,write_json = False):
         embedding = np.load(os.path.join(data_dir, 'word2vec.npy'))
 
         with tf.Session() as sess:
+            saver = tf.train.Saver()
+
             self._init_vars(sess)
-            saved_global_step = load(saver, sess, save_dir)
-            batches,lengthes,features,songnames= self.get_batches(BATCH_SIZE , set_no=1,feature_dict = get_audio_feature())
+            _ = load(saver, sess, save_dir)
+            batches,lengthes,features,songnames= self.get_batches(BATCH_SIZE , set_no=4,feature_dict = get_audio_feature())
             if num!= None:
                 batches = batches[:num]
                 lengthes = lengthes[:num]
-#            decoder_inputs = np.zeros([1, 1], dtype=np.int32)
             if write_json:
                 strings = dict()
 
@@ -312,8 +339,8 @@ class Generator:
                         input_length = start_word * np.ones(BATCH_SIZE)
                         state = sess.run(self.decoder_init_state)
 
-                        for ii in range(1):
-                            for jj in range(1):
+                        for ii in range(_NUM_LAYERS):
+                            for jj in range(2):
                                 for kk in range(BATCH_SIZE):
                                     state[ii][jj][kk] = \
                                         features[batch_i][kk][ii * _NUM_UNITS:(ii+1) * _NUM_UNITS]
@@ -332,11 +359,9 @@ class Generator:
                             self._embed_ph: embedding})
                     for i in range(BATCH_SIZE):#pick the word
                         temp = prob[i,- 1].tolist()
-                        pre_word = pick_word(temp, self.int2ch)
+                        pre_word = pick_word(temp)
                         gen_sentence[i].append(pre_word)
                 batch = batch.tolist()
-#                strings = []
-                songname = []
 
                 for i in range(BATCH_SIZE):#为后面的输出batch做处理
                     for word_i in range(total_length):
@@ -344,40 +369,26 @@ class Generator:
                         if batch[i][word_i] == '\end':
                             batch[i] = batch[i][0:word_i + 1]
                             break
-
-                scores = [[],[]]
                 for sentence in range(BATCH_SIZE):
                     for word_i in range(total_length):
                         gen_sentence[sentence][word_i] = self.int2ch[gen_sentence[sentence][word_i]]
                         if gen_sentence[sentence][word_i] == '\end' or word_i == (total_length - 1):
                             gen_sentence[sentence][-1] = '\end'
+                            print('生成的句子: ',end='')
                             for word_ii in range(word_i + 1):
                                 print(gen_sentence[sentence][word_ii],end='')
                             gen_sentence[sentence] = gen_sentence[sentence][0:word_i + 1]
                             string = ''.join(gen_sentence[sentence][0:word_i + 1])
                             gen_string.append(string[1:-1])
                             break
-
                     print('')
+
+                    print('原来的句子: ', end='')
                     for word in batch[sentence]:
                         print(word,end='')
                     print('')
-                    try:
-                        score_1 = sentence_bleu([batch[sentence]],gen_sentence[sentence])
-                        if (len(batch[sentence]) <= start_word + 1)  or (len(gen_sentence[sentence]) <= start_word + 1):
-                            score_2 = score_1
-                        else:
-                            score_2 = sentence_bleu([batch[sentence][start_word:-1]],gen_sentence[sentence][start_word:-1])
-                    except:
-                        print('bleu count error')
-                    scores[0].append(score_1)
-                    scores[1].append(score_2)
-                    print('bleu score_1 = '+str(score_1))
-                    print('bleu score_2 = ' + str(score_2))
-#                            string = ''.join(gen_sentence[sentence][0:total_length])
-                print('Batch {:>3}   mean_bleu_2 = {:.3f} , mean_bleu_1 = {:.3f}'.format(batch_i,
-                                                                                         np.mean(np.array(scores[1])),
-                                                                                         np.mean(np.array(scores[0]))))
+
+
                 if write_json:
                     for sen_i,sen in enumerate(gen_string):
                         try:
@@ -420,7 +431,7 @@ class Generator:
             if random.random() < replace_prob:
                 for i in range(BATCH_SIZE):#不替换padding
                     temp = prob[i, -1].tolist()
-                    pre_word = pick_word(temp, self.int2ch)
+                    pre_word = pick_word(temp)
                     if i<batch_length[i]:
                         batch[i,length] = pre_word
                     else:
@@ -431,8 +442,8 @@ class Generator:
 
 
 # 不知道为什么作为class Generator 的函数就会出错..
-def pick_word(probabilities,int2ch):#return int
-    probabilities[1]/=2
+def pick_word(probabilities):#return int
+    probabilities[2]/=2# \end have less prob
     candidate = np.argsort(probabilities)[-5:]
     new_prob = []
     for ch in candidate:
@@ -489,4 +500,4 @@ if __name__ == '__main__':
     generator = Generator()
     n_epoch = args.n_epoch
     generator.train(n_epoch)
-#    generator.generate()
+#    generator.generate(1)
