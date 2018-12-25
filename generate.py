@@ -190,7 +190,7 @@ class Generator:
         learn_rate = args.lr
         decay_rate = args.decay_rate
         replace_decay = args.replace_decay
-        last_valid_loss = 0#temp
+        last_valid_loss = 0
         last_train_loss = 0
 
         print("Start training RNN enc-dec model ...")
@@ -213,22 +213,11 @@ class Generator:
                     sess.run(tf.assign(self.learn_rate, learn_rate * decay_rate ** (epoch//5*5)))
                     total_loss = 0
                     temp_total_loss = 0
-                    for batch_i,batch in enumerate(batches):
+                    for batch_i,batch in enumerate(batches[0:50]):
                         replaced_batch = self.replace(sess,batch,length[batch_i],replace_prob)
                         target_batch = self.get_target_batch(batch,length[batch_i])
                         feature_batch = features[batch_i]
-                        feature_length = []
-                        for i in range(BATCH_SIZE):
-                            temp_length = feature_batch[i].shape[0] // (_NUM_UNITS*10) * (_NUM_UNITS*10)
-                            feature_batch[i] = np.reshape(feature_batch[i][:temp_length],[10,-1,_NUM_UNITS])
-                            feature_batch[i] = np.mean(feature_batch[i],0)
-                            feature_length.append(feature_batch[i].shape[0])
-                        temp_max_length = np.max(feature_length)
-                        temp_feature_batch = np.zeros([BATCH_SIZE,temp_max_length,_NUM_UNITS])
-                        for i in range(BATCH_SIZE):
-                            temp_feature_batch[i,0:feature_batch[i].shape[0],:] = feature_batch[i]
-                        feature_batch =temp_feature_batch
-                        feature_length = np.array(feature_length)
+                        feature_batch, feature_length = prepare_feature_batch(feature_batch)
                         outputs, loss,_ = sess.run([self.decoder_final_state, self.loss, self.train_op], feed_dict={
                             self.encoder_inputs:feature_batch,
                             self.encoder_lengths:feature_length,
@@ -246,58 +235,14 @@ class Generator:
                                 total_loss - temp_total_loss))
                             temp_total_loss = total_loss
                     print('Epoch {:>3}   total_loss = {:.3f}({:.3f}),avg = {:.3f} lr = {:.5f} replace_prob = {:.3f}'.format(
-                        epoch,
-                        total_loss,
-                        total_loss - last_train_loss,
-                        total_loss / len(batches),
-                        sess.run(self.learn_rate),
-                        replace_prob))
+                        epoch,total_loss,total_loss - last_train_loss,total_loss / len(batches),sess.run(self.learn_rate),replace_prob))
                     log.write('Epoch {:>3}   total_loss = {:.3f}({:.3f}),avg = {:.3f} lr = {:.5f} replace_prob = {:.3f}\n'.format(
-                        epoch,
-                        total_loss,
-                        total_loss - last_train_loss,
-                        total_loss/len(batches),
-                        sess.run(self.learn_rate),replace_prob))
+                        epoch,total_loss,total_loss - last_train_loss,total_loss/len(batches),sess.run(self.learn_rate),replace_prob))
                     last_train_loss = total_loss
                     print(time.ctime())
                     log.write(time.ctime()+'\n')
                     #valid
-                    batches, length,features,_ = self.get_batches(BATCH_SIZE, set_no=2,feature_dict = get_audio_feature())
-                    total_valid_loss = 0
-                    total_valid_times = 0
-                    for batch_i, batch in enumerate(batches):
-
-                        feature_batch = features[batch_i]
-                        feature_length = []
-                        for i in range(BATCH_SIZE):
-                            temp_length = feature_batch[i].shape[0] // (_NUM_UNITS*10) * (_NUM_UNITS*10)
-                            feature_batch[i] = np.reshape(feature_batch[i][:temp_length],[10,-1,_NUM_UNITS])
-                            feature_batch[i] = np.mean(feature_batch[i],0)
-                            feature_length.append(feature_batch[i].shape[0])
-                        temp_max_length = np.max(feature_length)
-                        temp_feature_batch = np.zeros([BATCH_SIZE,temp_max_length,_NUM_UNITS])
-                        for i in range(BATCH_SIZE):
-                            temp_feature_batch[i,0:feature_batch[i].shape[0],:] = feature_batch[i]
-                        feature_batch =temp_feature_batch
-                        feature_length = np.array(feature_length)
-
-                        target_batch = self.get_target_batch(batch,length[batch_i])
-                        outputs, loss = sess.run([self.decoder_final_state, self.loss], feed_dict={
-                            self.encoder_inputs: feature_batch,
-                            self.encoder_lengths: feature_length,
-                            self.decoder_inputs: batch[:, :-1],
-                            self.targets: target_batch[:, 1:],
-                            self.decoder_lengths: length[batch_i],
-                            self._embed_ph: embedding})
-                        total_valid_loss += loss
-                        total_valid_times += 1
-                    print('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}'.format(total_valid_loss,
-                                                                                  total_valid_loss-last_valid_loss,
-                                                                                  total_valid_loss/total_valid_times))
-                    log.write('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}\n'.format(total_valid_loss,
-                                                                                  total_valid_loss-last_valid_loss,
-                                                                                  total_valid_loss/total_valid_times))
-                    last_valid_loss = total_valid_loss
+                    last_valid_loss = self.valid(sess,embedding,log,last_valid_loss)
                     #save
                     if epoch % 5 == 0:
                         save(saver, sess, save_dir, epoch)
@@ -308,13 +253,34 @@ class Generator:
             except KeyboardInterrupt:
                 print("\nTraining is interrupted.")
 
+    def valid(self,sess,embedding,log,last_valid_loss):
+        total_valid_loss = 0
+        total_valid_times = 0
+        batches, length, features, _ = self.get_batches(BATCH_SIZE, set_no=2, feature_dict=get_audio_feature())
+        for batch_i, batch in enumerate(batches[0:50]):
+            feature_batch = features[batch_i]
+            feature_batch,feature_length = prepare_feature_batch(feature_batch)
+            target_batch = self.get_target_batch(batch, length[batch_i])
+            outputs, loss = sess.run([self.decoder_final_state, self.loss], feed_dict={
+                self.encoder_inputs: feature_batch,
+                self.encoder_lengths: feature_length,
+                self.decoder_inputs: batch[:, :-1],
+                self.targets: target_batch[:, 1:],
+                self.decoder_lengths: length[batch_i],
+                self._embed_ph: embedding})
+            total_valid_loss += loss
+            total_valid_times += 1
+        print('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}'.format(
+            total_valid_loss,total_valid_loss - last_valid_loss,total_valid_loss / total_valid_times))
+        log.write('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}\n'.format(
+            total_valid_loss,total_valid_loss - last_valid_loss,total_valid_loss / total_valid_times))
+        last_valid_loss = total_valid_loss
+        return last_valid_loss
 
     def generate(self,num = None,start_word = 5,write_json = False):
         embedding = np.load(os.path.join(data_dir, 'word2vec.npy'))
-
         with tf.Session() as sess:
             saver = tf.train.Saver()
-
             self._init_vars(sess)
             _ = load(saver, sess, save_dir)
             batches,lengthes,features,songnames= self.get_batches(BATCH_SIZE , set_no=4,feature_dict = get_audio_feature())
@@ -335,18 +301,15 @@ class Generator:
                     song_names.append(songnames[batch_i][i])
                     gen_sentence[i].extend(prime_word[i])
                 for length in range(start_word - 1, total_length):
-                    if length == start_word - 1:
+                    if length == start_word - 1:#initialize the state
                         input_length = start_word * np.ones(BATCH_SIZE)
-                        state = sess.run(self.decoder_init_state)
+                        feature_batch = features[batch_i]
+                        feature_batch,feature_length = prepare_feature_batch(feature_batch)
 
-                        for ii in range(_NUM_LAYERS):
-                            for jj in range(2):
-                                for kk in range(BATCH_SIZE):
-                                    state[ii][jj][kk] = \
-                                        features[batch_i][kk][ii * _NUM_UNITS:(ii+1) * _NUM_UNITS]
                         prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
+                            self.encoder_inputs: feature_batch,
+                            self.encoder_lengths: feature_length,
                             self.decoder_inputs: np.array(gen_sentence),
-                            self.decoder_init_state: state,
                             self.decoder_lengths: input_length,
                             self._embed_ph: embedding})
                         continue
@@ -396,11 +359,6 @@ class Generator:
                         except:
                             strings[songnames[batch_i][sen_i]] = [sen]
 
-#            for name in strings.keys():
-#                os.mkdir(param.get_generate_text_dir() + name)
-#                with open(param.get_generate_text_dir() + name + '/' + name + '.json', 'w', encoding='utf-8') as f:
-#                    f.write(json.dumps(strings[name], ensure_ascii=False))
-
     def replace(self,sess,batch,batch_length,replace_prob): #Schedueld Sampling
         if replace_prob < 1e-4:
             return batch
@@ -443,7 +401,7 @@ class Generator:
 
 # 不知道为什么作为class Generator 的函数就会出错..
 def pick_word(probabilities):#return int
-    probabilities[2]/=2# \end have less prob
+    probabilities[3]/=2# \end have less prob
     candidate = np.argsort(probabilities)[-5:]
     new_prob = []
     for ch in candidate:
@@ -473,8 +431,6 @@ def save(saver, sess, logdir, step):
     saver.save(sess, checkpoint_path, global_step=step)
     print(' Done.')
 
-
-
 def load(saver, sess, logdir):
     print("Trying to restore saved checkpoints from {} ...".format(logdir),
           end="")
@@ -493,6 +449,21 @@ def load(saver, sess, logdir):
     else:
         print(" No checkpoint found.")
         return None
+
+def prepare_feature_batch(feature_batch):
+    feature_length = []
+    for i in range(BATCH_SIZE):
+        temp_length = feature_batch[i].shape[0] // (_NUM_UNITS * 10) * (_NUM_UNITS * 10)
+        feature_batch[i] = np.reshape(feature_batch[i][:temp_length], [10, -1, _NUM_UNITS])
+        feature_batch[i] = np.mean(feature_batch[i], 0)
+        feature_length.append(feature_batch[i].shape[0])
+    temp_max_length = np.max(feature_length)
+    temp_feature_batch = np.zeros([BATCH_SIZE, temp_max_length, _NUM_UNITS])
+    for i in range(BATCH_SIZE):
+        temp_feature_batch[i, 0:feature_batch[i].shape[0], :] = feature_batch[i]
+    feature_batch = temp_feature_batch
+    feature_length = np.array(feature_length)
+    return feature_batch,feature_length
 
 if __name__ == '__main__':
     args = get_arguments()
