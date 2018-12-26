@@ -4,6 +4,7 @@ from nltk.translate.bleu_score import sentence_bleu
 import tensorflow as tf
 from audio_feature import *
 from tensorflow.contrib import rnn
+from tensorflow.contrib.layers import *
 import numpy as np
 import random
 import argparse
@@ -15,7 +16,7 @@ data_dir = param.get_data_dir()
 save_dir = param.get_save_dir()
 _NUM_UNITS = param.get_embed_dim()#输入宽度
 _NUM_LAYERS = 2
-BATCH_SIZE = 20
+BATCH_SIZE = 16
 if_segment = param.if_segment()
 
 stop_dir = param.get_stop_dir()
@@ -43,39 +44,55 @@ def get_arguments():
     parser.add_argument('--replace_decay',type=float,default=1,help = 'the decay of the scheduled sampling')
     parser.add_argument('--num_layer',type = int,default=_NUM_LAYERS,help = 'the num of layers of the RNN')
     parser.add_argument('--n_epoch',type = int,default = 50,help= 'the num of the training epoch')
-    return parser.parse_args()
+    parser.add_argument('--loss_type', type=int, default=1, help='the num of the training epoch')
 
+    return parser.parse_args()
+'''self.encoder_cell_fw = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
+            self.encoder_cell_bw = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
+            self.encoder_init_state_fw = self.encoder_cell_fw.zero_state(BATCH_SIZE, dtype=tf.float32)
+            self.encoder_init_state_bw = self.encoder_cell_bw.zero_state(BATCH_SIZE, dtype=tf.float32)
+            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None,_NUM_UNITS])
+            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
+            _, self.encoder_final_state = tf.nn.bidirectional_dynamic_rnn(
+                cell_fw=self.encoder_cell_fw,
+                cell_bw=self.encoder_cell_bw,
+                initial_state_fw=self.encoder_init_state_fw,
+                initial_state_bw=self.encoder_init_state_bw,
+                inputs=self.encoder_inputs,
+                sequence_length=self.encoder_lengths)
+'''
 
 class Generator:
     def __init__(self):
         keep_prob = 0.8# dropout
         self.int2ch, self.ch2int = get_vocab(if_segment)
+
         VOCAB_SIZE = len(self.int2ch)
         self.learn_rate = tf.Variable(0.0, trainable = False)
-        with tf.variable_scope('cell',initializer=tf.contrib.layers.xavier_initializer()):
-            self.encoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
-            self.encoder_init_state = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
-            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None,_NUM_UNITS])
-            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
-            _, self.encoder_final_state = tf.nn.dynamic_rnn(
-                cell=self.encoder_cell,
-                initial_state=self.encoder_init_state,
-                inputs=self.encoder_inputs,
-                sequence_length=self.encoder_lengths,
-                scope='encoder')
-
-            # embedding 层
-            self.embedding = tf.get_variable(name = 'embedding',shape=[VOCAB_SIZE, _NUM_UNITS],trainable = True,
-                                             initializer=tf.contrib.layers.xavier_initializer())
+#        with tf.variable_scope('cell',initializer=tf.orthogonal_initializer()):
+        with tf.variable_scope('embedding'):
+            self.embedding = tf.get_variable(name='embedding', shape=[VOCAB_SIZE, _NUM_UNITS], trainable=True)
             self._embed_ph = tf.placeholder(tf.float32, [VOCAB_SIZE, _NUM_UNITS])
             self._embed_init = self.embedding.assign(self._embed_ph)
+        with tf.variable_scope('cell', initializer=xavier_initializer()):
+            self.encoder_cell = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS,activation=tf.tanh)] * _NUM_LAYERS)
+            self.encoder_init_state = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
+            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None, _NUM_UNITS])
+            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
+            _, self.encoder_final_state = tf.nn.dynamic_rnn(
+                    cell=self.encoder_cell,
+                    initial_state=self.encoder_init_state,
+                    inputs=self.encoder_inputs,
+                    sequence_length=self.encoder_lengths,
+                    scope='encoder')
+
+            # embedding 层
 
 #            self.decoder_cell = rnn.MultiRNNCell([rnn.GRUCell(_NUM_UNITS)] * _NUM_LAYERS)
 #            self.initial_state = tf.placeholder(tf.float32, [_NUM_LAYERS * _NUM_UNITS * 2])
-            self.decoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
+            self.decoder_cell = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS,activation=tf.tanh)] * _NUM_LAYERS)
             self.decoder_cell_drop = tf.contrib.rnn.DropoutWrapper(self.decoder_cell, output_keep_prob=keep_prob)
-#            self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
-#            self.decoder_init_state = self.decoder_cell_drop.get_initial_state(self.initial_state,BATCH_SIZE,dtype=tf.float32)
+            self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
 
             self.decoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
             self.decoder_inputs = tf.placeholder(tf.int32, [BATCH_SIZE, None])
@@ -85,13 +102,12 @@ class Generator:
                 inputs = tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),#输入x
                 sequence_length = self.decoder_lengths,
                 dtype = tf.float32,
-                scope = 'decoder')
+                scope='decoder')
 
         #这里直接用softmax
-        with tf.variable_scope('decoder'):
-            self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
-            self.softmax_b = tf.get_variable('softmax_b', [VOCAB_SIZE],initializer=tf.contrib.layers.xavier_initializer())
-
+        with tf.variable_scope('postprocessing',initializer=xavier_initializer()):
+            self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, VOCAB_SIZE])
+            self.softmax_b = tf.get_variable('softmax_b', [VOCAB_SIZE])
         self.logits = tf.nn.bias_add(tf.matmul(tf.reshape(self.outputs, [-1, _NUM_UNITS]), self.softmax_w),
                 bias = self.softmax_b)
         self.probs = tf.reshape(tf.nn.softmax(self.logits), [BATCH_SIZE,-1,VOCAB_SIZE])#输出应该是一个one_shot向量
@@ -105,21 +121,32 @@ class Generator:
             temp_len_labels.append(self.labels[0,0:self.decoder_lengths[i],:])
             temp_len_logits.append(self.logits[0, 0:self.decoder_lengths[i], :])
         self.logits_2 = tf.concat(temp_len_logits,0)
-        self.labels = tf.concat(temp_len_labels,0)
+        self.labels_2 = tf.concat(temp_len_labels,0)
 
-        loss = tf.nn.softmax_cross_entropy_with_logits(
-                logits = self.logits_2,
-                labels = self.labels)
+        if args.loss_type == 1:
+            loss = tf.nn.softmax_cross_entropy_with_logits(
+                    logits = self.logits_2,
+                    labels = self.labels_2)
+        elif args.loss_type == 2:
+            loss = tf.nn.softmax_cross_entropy_with_logits(
+                logits=self.logits,
+                labels=self.labels)
         self.loss = tf.reduce_mean(loss)
 
+
         # 裁剪一下Gradient输出，最后的gradient都在[-1, 1]的范围内
-        self.opt_op = tf.train.AdamOptimizer(self.learn_rate)
-        self.gradients = self.opt_op.compute_gradients(self.loss)#TODO : add var_list for different lr
+        var_list_1 = tf.trainable_variables('embedding')
+        var_list_2 = tf.trainable_variables()[1:]
+        self.opt_op_1 = tf.train.AdamOptimizer(self.learn_rate/100)
+        self.opt_op_2 = tf.train.AdamOptimizer(self.learn_rate)
+        self.gradients_1 = self.opt_op_1.compute_gradients(self.loss,var_list=var_list_1)#TODO : add var_list for different lr
+        self.gradients_2 = self.opt_op_2.compute_gradients(self.loss,var_list=var_list_2)#TODO : add var_list for different lr
         # 修建gradient
-        self.capped_gradients = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in self.gradients if grad is not None]
-        self.train_op = self.opt_op.apply_gradients(self.capped_gradients)
-
-
+        self.capped_gradients_1 = [(tf.clip_by_value(grad, -1, 1), var) for grad, var in self.gradients_1 if grad is not None]
+        self.capped_gradients_2 = [(tf.clip_by_value(grad, -10, 10), var) for grad, var in self.gradients_2 if grad is not None]
+        self.train_op_1 = self.opt_op_1.apply_gradients(self.capped_gradients_1)
+        self.train_op_2 = self.opt_op_2.apply_gradients(self.capped_gradients_2)
+        self.train_op = tf.group(self.train_op_1, self.train_op_2)
 
     def _init_vars(self, sess):
         init_op = tf.group(tf.global_variables_initializer(),
@@ -166,8 +193,7 @@ class Generator:
             for text_i,text in enumerate(total_text[batch_i*batch_size : (batch_i+1)*batch_size]):
                 text_length = len(text)
                 for zero_i in range(text_length ,max_length[batch_i]):
-                    total_text[batch_i * batch_size + text_i].append(3)#调节为等长度，以便化为array
-                    #
+                    total_text[batch_i * batch_size + text_i].append(self.ch2int['\end'])#调节为等长度，以便化为array
             batches.append(np.array(total_text[batch_i * batch_size:(batch_i + 1) * (batch_size)]))
 
             temp_feature = []
@@ -184,7 +210,7 @@ class Generator:
         target_batch = batch.copy()
         for i in range(BATCH_SIZE):
             for j in range(length[i], batch.shape[-1]):
-                target_batch[i][j] = 3
+                target_batch[i][j] = self.ch2int['\end']
         return target_batch
     def train(self,n_epochs = 100):
         learn_rate = args.lr
@@ -213,7 +239,7 @@ class Generator:
                     sess.run(tf.assign(self.learn_rate, learn_rate * decay_rate ** (epoch//5*5)))
                     total_loss = 0
                     temp_total_loss = 0
-                    for batch_i,batch in enumerate(batches[0:50]):
+                    for batch_i,batch in enumerate(batches):
                         replaced_batch = self.replace(sess,batch,length[batch_i],replace_prob)
                         target_batch = self.get_target_batch(batch,length[batch_i])
                         feature_batch = features[batch_i]
@@ -317,7 +343,7 @@ class Generator:
                         input_length = np.ones(BATCH_SIZE)
                         prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
                             self.decoder_inputs: np.array(gen_sentence)[:,-1:],
-                            self.decoder_init_state: state,
+                            self.encoder_final_state: state,
                             self.decoder_lengths: input_length,
                             self._embed_ph: embedding})
                     for i in range(BATCH_SIZE):#pick the word
@@ -339,6 +365,8 @@ class Generator:
                             gen_sentence[sentence][-1] = '\end'
                             print('生成的句子: ',end='')
                             for word_ii in range(word_i + 1):
+                                if word_ii == start_word:
+                                    print('   ',end='')
                                 print(gen_sentence[sentence][word_ii],end='')
                             gen_sentence[sentence] = gen_sentence[sentence][0:word_i + 1]
                             string = ''.join(gen_sentence[sentence][0:word_i + 1])
@@ -347,7 +375,9 @@ class Generator:
                     print('')
 
                     print('原来的句子: ', end='')
-                    for word in batch[sentence]:
+                    for word_i,word in enumerate(batch[sentence]):
+                        if word_i == start_word:
+                            break
                         print(word,end='')
                     print('')
 
@@ -367,7 +397,7 @@ class Generator:
         for i in range(BATCH_SIZE):
             if batch_length[i] > max_len:
                 max_len  = batch_length[i]
-        state = sess.run(self.decoder_init_state)
+#        state = sess.run(self.decoder_init_state)
         for length in range(max_len):
             if length < 5:
                 continue
@@ -375,14 +405,14 @@ class Generator:
             if length == 5:
                 input_length = 5 * np.ones(BATCH_SIZE)
                 prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                    self.decoder_init_state: state,
+                    self.encoder_init_state: state,
                     self.decoder_inputs: batch[:, :length],
                     self.decoder_lengths: input_length,
                     self._embed_ph: embedding})
             else:
                 input_length = np.ones(BATCH_SIZE)
                 prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                    self.decoder_init_state:state,
+                    self.encoder_final_state:state,
                     self.decoder_inputs: batch[:,-1:],
                     self.decoder_lengths: input_length,
                     self._embed_ph: embedding})
@@ -468,6 +498,7 @@ def prepare_feature_batch(feature_batch):
 if __name__ == '__main__':
     args = get_arguments()
     _NUM_LAYERS = args.num_layer
+    BATCH_SIZE = args.batch_size
     generator = Generator()
     n_epoch = args.n_epoch
     generator.train(n_epoch)
