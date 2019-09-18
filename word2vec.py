@@ -7,7 +7,7 @@ from numpy.random import uniform
 # embedding layer的大小
 data_dir = param.get_data_dir()
 _w2v_path = os.path.join(data_dir, 'word2vec.npy')
-ndim = param.get_embed_dim()
+ndim = param.INPUT_DIM
 
 def gen_embedding(if_segment = False):
     int2ch, ch2int = get_vocab(if_segment)
@@ -18,6 +18,7 @@ def gen_embedding(if_segment = False):
         if ch in model.wv:
             embedding[idx, :] = model.wv[ch]
     np.save(_w2v_path, embedding)
+    print(embedding.shape)
     print("Word embedding is saved.")
 
 

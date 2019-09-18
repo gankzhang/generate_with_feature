@@ -1,491 +1,363 @@
 from vocab import *
-#from tensorflow.contrib import seq2seq
-from nltk.translate.bleu_score import sentence_bleu
-import tensorflow as tf
-from audio_feature import *
 from tensorflow.contrib import rnn
 from tensorflow.contrib.layers import *
-import numpy as np
-import random
+from tensorflow.python.ops import tensor_array_ops, control_flow_ops
+#from tensorflow.contrib.rnn.python.ops.core_rnn_cell_impl import LSTMStateTuple
+from tensorflow.contrib.rnn import LSTMStateTuple
 import argparse
-import sys
 import time
-from pick_word import *
+from relational_memory import *
+from data_utils import *
 _model_path = os.path.join(param.get_data_dir(), 'model')
 data_dir = param.get_data_dir()
 save_dir = param.get_save_dir()
-_NUM_UNITS = param.get_embed_dim()#输入宽度
-_NUM_LAYERS = 2
-BATCH_SIZE = 16
+_NUM_UNITS = param.NUM_UNITS#输入宽度
 if_segment = param.if_segment()
 
-stop_dir = param.get_stop_dir()
-stopwords = [line.strip() for line in (open(stop_dir, 'r', encoding='utf-8')).readlines()]
-stopwords.append(' ')
-stopwords.append('\n')
+log_device_placement=True#是否打印设备分配日志
+allow_soft_placement=True#如果你指定的设备不存在，允许TF自动分配设备
+tf.ConfigProto(log_device_placement=True,allow_soft_placement=True)
 
-stopwords_dict = dict()
-for stopword in stopwords:
-    stopwords_dict[stopword] = 1
-
-
-def get_arguments():
-    def _str_to_bool(s):
-        """Convert string to bool (in argparse context)."""
-        if s.lower() not in ['true', 'false']:
-            raise ValueError('Argument needs to be a '
-                             'boolean, got {}'.format(s))
-        return {'true': True, 'false': False}[s.lower()]
-
-    parser = argparse.ArgumentParser(description='WaveNet example network')
-    parser.add_argument('--lr', type=float, default=0.01,help = 'learning rate')
-    parser.add_argument('--decay_rate',type=float,default=0.9,help = 'lr decay rate')
-    parser.add_argument('--batch_size',type = int,default=16,help = 'batch size')
-    parser.add_argument('--replace_decay',type=float,default=1,help = 'the decay of the scheduled sampling')
-    parser.add_argument('--num_layer',type = int,default=_NUM_LAYERS,help = 'the num of layers of the RNN')
-    parser.add_argument('--n_epoch',type = int,default = 50,help= 'the num of the training epoch')
-    parser.add_argument('--loss_type', type=int, default=1, help='the num of the training epoch')
-
-    return parser.parse_args()
-'''self.encoder_cell_fw = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
-            self.encoder_cell_bw = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS)] * _NUM_LAYERS)
-            self.encoder_init_state_fw = self.encoder_cell_fw.zero_state(BATCH_SIZE, dtype=tf.float32)
-            self.encoder_init_state_bw = self.encoder_cell_bw.zero_state(BATCH_SIZE, dtype=tf.float32)
-            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None,_NUM_UNITS])
-            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
-            _, self.encoder_final_state = tf.nn.bidirectional_dynamic_rnn(
-                cell_fw=self.encoder_cell_fw,
-                cell_bw=self.encoder_cell_bw,
-                initial_state_fw=self.encoder_init_state_fw,
-                initial_state_bw=self.encoder_init_state_bw,
-                inputs=self.encoder_inputs,
-                sequence_length=self.encoder_lengths)
-'''
 
 class Generator:
-    def __init__(self):
-        keep_prob = 0.8# dropout
-        self.int2ch, self.ch2int = get_vocab(if_segment)
+    def __init__(self,encoder_inputs,encoder_lengths,encoder_inputs_2,encoder_lengths_2,decoder_inputs,
+                     decoder_lengths,_embed_ph,learn_rate,start_token,if_test = False,temperature = None,end_rate = 1):
+        self.start_tokens = tf.constant([start_token] * BATCH_SIZE, dtype=tf.int32)
 
-        VOCAB_SIZE = len(self.int2ch)
-        self.learn_rate = tf.Variable(0.0, trainable = False)
-#        with tf.variable_scope('cell',initializer=tf.orthogonal_initializer()):
-        with tf.variable_scope('embedding'):
-            self.embedding = tf.get_variable(name='embedding', shape=[VOCAB_SIZE, _NUM_UNITS], trainable=True)
-            self._embed_ph = tf.placeholder(tf.float32, [VOCAB_SIZE, _NUM_UNITS])
-            self._embed_init = self.embedding.assign(self._embed_ph)
-        with tf.variable_scope('cell', initializer=xavier_initializer()):
-            self.encoder_cell = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS,activation=tf.tanh)] * _NUM_LAYERS)
-            self.encoder_init_state = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
-            self.encoder_inputs = tf.placeholder(tf.float32, [BATCH_SIZE, None, _NUM_UNITS])
-            self.encoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
-            _, self.encoder_final_state = tf.nn.dynamic_rnn(
-                    cell=self.encoder_cell,
-                    initial_state=self.encoder_init_state,
-                    inputs=self.encoder_inputs,
-                    sequence_length=self.encoder_lengths,
-                    scope='encoder')
+        self.learn_rate = learn_rate
+        keep_prob = 0.8
 
-            # embedding 层
+        with tf.variable_scope('generator',initializer=tf.orthogonal_initializer()):
+            with tf.variable_scope('embedding'):
+                self.embedding = tf.get_variable(name='embedding', shape=[param.VOCAB_SIZE, INPUT_DIM], trainable=True)
+                self._embed_ph = _embed_ph
+                self._embed_init = self.embedding.assign(self._embed_ph)
+            self.encoder_inputs = encoder_inputs
+            self.encoder_lengths = encoder_lengths
+            if param.Use_VAE:
+                self.encoder_inputs_2 = encoder_inputs_2
+                self.encoder_lengths_2 = encoder_lengths_2
 
-#            self.decoder_cell = rnn.MultiRNNCell([rnn.GRUCell(_NUM_UNITS)] * _NUM_LAYERS)
-#            self.initial_state = tf.placeholder(tf.float32, [_NUM_LAYERS * _NUM_UNITS * 2])
-            self.decoder_cell = rnn.MultiRNNCell([rnn.LSTMCell(_NUM_UNITS,activation=tf.tanh)] * _NUM_LAYERS)
-            self.decoder_cell_drop = tf.contrib.rnn.DropoutWrapper(self.decoder_cell, output_keep_prob=keep_prob)
-            self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
+            self.decoder_lengths = decoder_lengths
+            self.decoder_inputs = decoder_inputs[:,:-1]
+            max_len = tf.shape(decoder_inputs)[-1]
 
-            self.decoder_lengths = tf.placeholder(tf.int32, [BATCH_SIZE])
-            self.decoder_inputs = tf.placeholder(tf.int32, [BATCH_SIZE, None])
-            self.outputs, self.decoder_final_state = tf.nn.dynamic_rnn(
-                cell = self.decoder_cell_drop,
-                initial_state = self.encoder_final_state,#初始状态,h
-                inputs = tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),#输入x
-                sequence_length = self.decoder_lengths,
-                dtype = tf.float32,
-                scope='decoder')
+            with tf.variable_scope('cell', initializer=xavier_initializer()):
+                self.encoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS,activation=tf.tanh) for _ in range(param.NUM_LAYERS)])
+                self.encoder_init_state = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
 
-        #这里直接用softmax
-        with tf.variable_scope('postprocessing',initializer=xavier_initializer()):
-            self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, VOCAB_SIZE])
-            self.softmax_b = tf.get_variable('softmax_b', [VOCAB_SIZE])
-        self.logits = tf.nn.bias_add(tf.matmul(tf.reshape(self.outputs, [-1, _NUM_UNITS]), self.softmax_w),
-                bias = self.softmax_b)
-        self.probs = tf.reshape(tf.nn.softmax(self.logits), [BATCH_SIZE,-1,VOCAB_SIZE])#输出应该是一个one_shot向量
-        self.targets = tf.placeholder(tf.int32, [BATCH_SIZE, None])#训练用
-        self.labels = tf.one_hot(self.targets, depth = VOCAB_SIZE,dtype=tf.int32)
-        self.logits = tf.reshape(self.logits, [BATCH_SIZE,-1,VOCAB_SIZE])
-
-        temp_len_labels = []
-        temp_len_logits = []
-        for i in range(BATCH_SIZE):
-            temp_len_labels.append(self.labels[0,0:self.decoder_lengths[i],:])
-            temp_len_logits.append(self.logits[0, 0:self.decoder_lengths[i], :])
-        self.logits_2 = tf.concat(temp_len_logits,0)
-        self.labels_2 = tf.concat(temp_len_labels,0)
-
-        if args.loss_type == 1:
-            loss = tf.nn.softmax_cross_entropy_with_logits(
-                    logits = self.logits_2,
-                    labels = self.labels_2)
-        elif args.loss_type == 2:
-            loss = tf.nn.softmax_cross_entropy_with_logits(
-                logits=self.logits,
-                labels=self.labels)
-        self.loss = tf.reduce_mean(loss)
+                _, self.encoder_final_state = tf.nn.dynamic_rnn(
+                        cell=self.encoder_cell,
+                        initial_state=self.encoder_init_state,
+                        inputs=self.encoder_inputs,
+                        sequence_length=self.encoder_lengths,
+                        scope='encoder')
+                if param.Use_VAE:
+                    self.encoder_cell_2 = rnn.MultiRNNCell(
+                        [rnn.BasicLSTMCell(_NUM_UNITS, activation=tf.tanh) for _ in range(param.NUM_LAYERS)])
+                    self.encoder_init_state_2 = self.encoder_cell.zero_state(BATCH_SIZE, dtype=tf.float32)
+                    _, self.encoder_final_state_2 = tf.nn.dynamic_rnn(
+                        cell=self.encoder_cell_2,
+                        initial_state=self.encoder_init_state_2,
+                        inputs= tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),
+                        sequence_length=self.decoder_lengths,
+                        scope='encoder_2')
 
 
-        # 裁剪一下Gradient输出，最后的gradient都在[-1, 1]的范围内
-        var_list_1 = tf.trainable_variables('embedding')
-        var_list_2 = tf.trainable_variables()[1:]
-        self.opt_op_1 = tf.train.AdamOptimizer(self.learn_rate/100)
-        self.opt_op_2 = tf.train.AdamOptimizer(self.learn_rate)
-        self.gradients_1 = self.opt_op_1.compute_gradients(self.loss,var_list=var_list_1)#TODO : add var_list for different lr
-        self.gradients_2 = self.opt_op_2.compute_gradients(self.loss,var_list=var_list_2)#TODO : add var_list for different lr
-        # 修建gradient
-        self.capped_gradients_1 = [(tf.clip_by_value(grad, -1, 1), var) for grad, var in self.gradients_1 if grad is not None]
-        self.capped_gradients_2 = [(tf.clip_by_value(grad, -10, 10), var) for grad, var in self.gradients_2 if grad is not None]
-        self.train_op_1 = self.opt_op_1.apply_gradients(self.capped_gradients_1)
-        self.train_op_2 = self.opt_op_2.apply_gradients(self.capped_gradients_2)
-        self.train_op = tf.group(self.train_op_1, self.train_op_2)
 
-    def _init_vars(self, sess):
+
+                self.decoder_cell = rnn.MultiRNNCell([rnn.BasicLSTMCell(_NUM_UNITS) for _ in range(param.NUM_LAYERS)])
+                self.decoder_cell_drop = tf.contrib.rnn.DropoutWrapper(self.decoder_cell, output_keep_prob=keep_prob)
+                self.decoder_init_state = self.decoder_cell_drop.zero_state(BATCH_SIZE,dtype=tf.float32)
+                if param.Use_VAE:
+                    self.decoder_input_state_2 = self.encoder_final_state_2
+                    # self.decoder_input_state = (LSTMStateTuple(self.decoder_input_state[0,0],self.decoder_input_state[0,1]),
+                    #                         LSTMStateTuple(self.decoder_input_state[1,0],self.decoder_input_state[1,1]))
+
+                self.decoder_input_state = self.encoder_final_state
+
+                if Use_relational_memory:
+                    g_output_unit = create_output_unit(_NUM_UNITS * NUM_LAYERS * 2, param.VOCAB_SIZE)
+                    mem_slots = param.mem_slots
+                    head_size = param.head_size
+                    num_heads = param.num_heads
+                    gen_mem = RelationalMemory(mem_slots=mem_slots, head_size=head_size, num_heads=num_heads)
+                    self.decoder_inputs = tf.pad(self.decoder_inputs,[[0,0],[0,1]])
+                    x_emb = tf.transpose(tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),
+                                         perm=[1, 0, 2])  # seq_len x batch_size x emb_dim
+                    g_predictions = tensor_array_ops.TensorArray(dtype=tf.float32, size=max_len, dynamic_size=True,
+                                                                 infer_shape=True)
+                    g_predictions = g_predictions.write(0,tf.one_hot(self.decoder_inputs[:,0],param.VOCAB_SIZE))
+                    ta_emb_x = tensor_array_ops.TensorArray(dtype=tf.float32, size=max_len)
+                    ta_emb_x = ta_emb_x.unstack(x_emb)
+                    with tf.variable_scope('postprocessing', initializer=xavier_initializer()):
+                        if Post_with_state:
+                            self.softmax_w = tf.get_variable('softmax_w', [head_size*num_heads + 2 * NUM_UNITS, param.VOCAB_SIZE])
+                        else:
+                            self.softmax_w = tf.get_variable('softmax_w', [head_size*num_heads, param.VOCAB_SIZE])
+
+                        self.softmax_b = tf.get_variable('softmax_b', [param.VOCAB_SIZE])
+                    # the generator recurrent moddule used for pre-training
+                    def _pretrain_recurrence(i, x_t, h_tm1, g_predictions):
+                        mem_o_t, h_t = gen_mem(x_t, h_tm1)
+                        if Post_with_state:
+                            mem_o_t = tf.concat([tf.reshape(mem_o_t, [-1, head_size * num_heads]),
+                                                 self.decoder_input_state[:,0,:2*NUM_UNITS]],-1)
+                        else:
+                            mem_o_t = tf.reshape(mem_o_t, [-1, head_size * num_heads])
+                        o_t = tf.nn.bias_add(
+                            tf.matmul(mem_o_t, self.softmax_w),
+                            bias=self.softmax_b)
+                        #o_t = g_output_unit(mem_o_t)
+                        g_predictions = g_predictions.write(i, o_t)  # batch_size x vocab_size
+                        x_tp1 = ta_emb_x.read(i)
+                        return i + 1, x_tp1, h_t, g_predictions
+
+                    self.decoder_input_state = tf.convert_to_tensor(self.decoder_input_state)
+                    self.decoder_input_state = tf.transpose(self.decoder_input_state,
+                                         perm=[2, 0, 1, 3])
+                    self.decoder_input_state = tf.reshape(self.decoder_input_state,[BATCH_SIZE, mem_slots, -1])
+
+
+                    if param.Use_latent_z:
+                        self.decoder_input_state = tf.concat([tf.truncated_normal(shape=self.decoder_input_state.shape),
+                                                          self.decoder_input_state],axis = -1)
+                    elif Use_VAE:
+                        self.decoder_input_state_2 = tf.convert_to_tensor(self.decoder_input_state_2)
+                        self.decoder_input_state_2 = tf.transpose(self.decoder_input_state_2,
+                                             perm=[2, 0, 1, 3])
+                        self.decoder_input_state_2 = tf.reshape(self.decoder_input_state_2, [BATCH_SIZE, -1])
+                        self.mn = tf.layers.dense(self.decoder_input_state_2, units=NUM_UNITS*2)
+                        self.sd = 0.5 * tf.layers.dense(self.decoder_input_state_2, units=NUM_UNITS*2)
+                        epsilon = tf.random_normal(tf.stack([tf.shape(self.decoder_input_state_2)[0], NUM_UNITS*2]))
+                        self.decoder_input_state_2 = self.mn + tf.multiply(epsilon, tf.exp(self.sd))
+                        self.decoder_input_state_2 = tf.reshape(self.decoder_input_state_2, [BATCH_SIZE, mem_slots, -1])
+
+
+
+
+                        self.decoder_input_state = tf.concat([self.decoder_input_state_2,
+                                                          self.decoder_input_state],axis = -1)
+
+                    # build a graph for outputting sequential tokens
+                    _, _, self.decoder_final_state, self.outputs = control_flow_ops.while_loop(
+                        cond=lambda i, _1, _2, _3: i < max_len,
+                        body=_pretrain_recurrence,
+                        loop_vars=(tf.constant(1, dtype=tf.int32), tf.nn.embedding_lookup(self.embedding, self.decoder_inputs[:,0]),
+                                   self.decoder_input_state, g_predictions))
+
+                    self.logits = tf.transpose(self.outputs.stack()[1:,:,:],
+                                                 perm=[1, 0, 2])
+                else:
+                    self.outputs, self.decoder_final_state = tf.nn.dynamic_rnn(
+                        cell = self.decoder_cell_drop,
+                        initial_state = self.decoder_input_state,#初始状态,h
+                        inputs = tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),#输入x
+                        sequence_length = self.decoder_lengths,
+                        dtype = tf.float32,
+                        scope='decoder')
+
+
+
+            #这里直接用softmax
+
+            if Use_relational_memory:
+                pass
+            else:
+                # self.logits = g_output_unit(tf.reshape(self.outputs, [-1, _NUM_UNITS]))
+                with tf.variable_scope('cell/postprocessing', initializer=xavier_initializer()):
+                    self.softmax_w = tf.get_variable('softmax_w', [_NUM_UNITS, param.VOCAB_SIZE])
+                    self.softmax_b = tf.get_variable('softmax_b', [param.VOCAB_SIZE])
+                self.logits = tf.nn.bias_add(tf.matmul(tf.reshape(self.outputs, [-1, _NUM_UNITS]), self.softmax_w),
+                        bias = self.softmax_b)
+            self.probs = tf.reshape(tf.nn.softmax(self.logits), [BATCH_SIZE,-1,param.VOCAB_SIZE])#输出应该是一个one_shot向量
+            self.labels = tf.one_hot(decoder_inputs[:,1:], depth = param.VOCAB_SIZE,dtype=tf.int32)
+            self.right_count = tf.reduce_sum(tf.reduce_sum(tf.multiply(tf.one_hot(tf.argmax(self.probs,-1),param.VOCAB_SIZE),
+                                                                       tf.to_float(self.labels)),-1),-1)/tf.to_float(max_len)
+
+
+            self.logits = tf.reshape(self.logits, [BATCH_SIZE,-1,param.VOCAB_SIZE])
+            loss = get_loss(LOSS_TYPE,self.logits,self.labels,self.decoder_lengths,BATCH_SIZE)
+            self.loss = loss
+            self.original_loss = get_loss(1,self.logits,self.labels,self.decoder_lengths,BATCH_SIZE)
+            # ---------- generate tokens and approximated one-hot results (Adversarial) ---------
+            gen_o = tensor_array_ops.TensorArray(dtype=tf.float32, size=0, dynamic_size=True, infer_shape=True)#the prob
+            gen_x = tensor_array_ops.TensorArray(dtype=tf.int32, size=0, dynamic_size=True, infer_shape=True) # sampled token
+            gen_x_onehot_adv = tensor_array_ops.TensorArray(dtype=tf.float32, size=0, dynamic_size=True,
+                                                            infer_shape=True)  # generator output (relaxed of gen_x)
+
+            random_start_length = tf.constant(param.start_length,dtype=tf.int32)
+
+#            random_start_length = tf.random_uniform(shape = [],minval=0,maxval=sentence_min_len,dtype=tf.int32)
+            def _start_recurrence(word_i,gen_o,gen_x,gen_x_onehot_adv):
+                gen_x = gen_x.write(word_i, decoder_inputs[:, word_i])
+                gen_o = gen_o.write(word_i, tf.one_hot(decoder_inputs[:, word_i], param.VOCAB_SIZE, 1.0, 0.0))
+                gen_x_onehot_adv = gen_x_onehot_adv.write(word_i,tf.one_hot(decoder_inputs[:, word_i], param.VOCAB_SIZE, 1.0,
+                                                                     0.0)*1000000)
+                return word_i + 1, gen_o, gen_x, gen_x_onehot_adv
+            _, gen_o, gen_x, gen_x_onehot_adv = control_flow_ops.while_loop(
+                cond=lambda i,_1,_2,_3: i < random_start_length + 1,
+                body=_start_recurrence,
+                loop_vars=(tf.constant(0),gen_o, gen_x, gen_x_onehot_adv))
+
+            #temperature = param.temperature
+            # the generator recurrent module used for adversarial training
+            if Use_relational_memory:
+                with tf.variable_scope('cell/postprocessing', reuse = True):
+                    if Post_with_state:
+                        self.softmax_w = tf.get_variable('softmax_w', [param.head_size*param.num_heads + 2*NUM_UNITS, param.VOCAB_SIZE])
+                    else:
+                        self.softmax_w = tf.get_variable('softmax_w', [param.head_size*param.num_heads, param.VOCAB_SIZE])
+
+                    self.softmax_b = tf.get_variable('softmax_b', [param.VOCAB_SIZE])
+                if param.start_length >= 1:
+                    x_emb = tf.transpose(tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),
+                                         perm=[1, 0, 2])
+                    ta_emb_gen_x = tensor_array_ops.TensorArray(dtype=tf.float32, size=max_len)
+                    ta_emb_gen_x = ta_emb_gen_x.unstack(x_emb)
+                    # the generator recurrent moddule used for pre-training
+                    def _start_rel_recurrence(i, x_t, h_tm1):
+                        mem_o_t, h_t = gen_mem(x_t, h_tm1)
+                        if Post_with_state:
+                            mem_o_t = tf.concat([tf.reshape(mem_o_t, [-1, head_size * num_heads]),
+                                                 self.decoder_input_state[:,0,:2*NUM_UNITS]],-1)
+                        else:
+                            mem_o_t = tf.reshape(mem_o_t, [-1, head_size * num_heads])
+                        o_t = tf.nn.bias_add(
+                            tf.matmul(mem_o_t, self.softmax_w),
+                            bias=self.softmax_b)
+                        x_tp1 = ta_emb_gen_x.read(i)
+                        return i + 1, x_tp1, h_t
+
+                    self.decoder_start_word_state = \
+                        tf.cond(random_start_length > 0,
+                        lambda: (control_flow_ops.while_loop(
+                        cond=lambda i, _1, _2: i < random_start_length + 1,
+                        body=_start_rel_recurrence,
+                        loop_vars=(
+                        tf.constant(1, dtype=tf.int32),
+                        tf.nn.embedding_lookup(self.embedding, self.decoder_inputs[:,0]),
+                        self.decoder_input_state)))[2],
+                        lambda: self.decoder_input_state)
+                    # _, _, self.decoder_start_word_state = control_flow_ops.while_loop(
+                    #     cond=lambda i, _1, _2: i < random_start_length + 1,
+                    #     body=_start_rel_recurrence,
+                    #     loop_vars=(
+                    #     tf.constant(1, dtype=tf.int32),
+                    #     tf.nn.embedding_lookup(self.embedding, self.decoder_inputs[:,0]),
+                    #     self.decoder_input_state))
+                else:
+                    self.decoder_start_word_state = self.decoder_input_state
+            else:
+                with tf.variable_scope('cell', reuse= True):
+                    _, self.decoder_start_word_state = tf.nn.dynamic_rnn(
+                        cell=self.decoder_cell_drop,
+                        initial_state=self.encoder_final_state,  # 初始状态,h
+                        inputs=tf.nn.embedding_lookup(self.embedding, self.decoder_inputs),  # 输入x
+                        sequence_length=np.ones(BATCH_SIZE) * random_start_length,
+                        dtype=tf.float32,
+                        scope='decoder')
+
+            def _gen_recurrence(i, x_t, state, gen_o, gen_x, gen_x_onehot_adv):
+                if Use_relational_memory:
+                    mem_o_t, state = gen_mem(x_t, state)  # hidden_memory_tuple
+                    if Post_with_state:
+                        mem_o_t = tf.concat([tf.reshape(mem_o_t, [-1, head_size * num_heads]),
+                                             self.decoder_input_state[:, 0, :2 * NUM_UNITS]],-1)
+                    else:
+                        mem_o_t = tf.reshape(mem_o_t, [-1, head_size * num_heads])
+                    logits = tf.nn.bias_add(
+                        tf.matmul(mem_o_t, self.softmax_w),
+                        bias=self.softmax_b)
+
+                    pad = np.ones((BATCH_SIZE, VOCAB_SIZE))
+                    pad_2 = tf.one_hot(tf.to_int32(tf.constant(np.ones((BATCH_SIZE))*2)),depth=VOCAB_SIZE)
+                    pad_2 = tf.multiply(pad_2,end_rate -1)
+                    pad = tf.constant(pad)
+                    pad = tf.add(tf.to_float(pad),tf.to_float(pad_2))
+                    logits = tf.multiply(logits, pad)
+
+                else:
+                    with tf.variable_scope('cell', reuse=True):
+                        outputs, state = rnn.static_rnn(cell = self.decoder_cell_drop,
+                            initial_state = state,
+                            inputs = [x_t],#输入x
+                            sequence_length = np.ones(BATCH_SIZE),
+                            dtype = tf.float32,
+                            scope='decoder')
+                    with tf.variable_scope('postprocessing', reuse=True):
+                        logits = tf.nn.bias_add(tf.matmul(tf.reshape(outputs, [-1, _NUM_UNITS]), self.softmax_w),
+                                                bias=self.softmax_b)
+#                logits = g_output_unit(tf.reshape(outputs, [-1, _NUM_UNITS]))
+                prob = tf.reshape(tf.nn.softmax(logits), [BATCH_SIZE, param.VOCAB_SIZE])#without length
+                if not if_test:
+                    gumbel_t = add_gumbel(logits)
+                else:
+#                    gumbel_t = logits
+                    gumbel_t = add_gumbel(tf.multiply(1.2, logits))
+
+                next_token = tf.to_int32(tf.stop_gradient(tf.argmax(gumbel_t, axis=1)))
+                next_token_onehot = tf.one_hot(next_token, param.VOCAB_SIZE, 1.0, 0.0)
+                x_onehot_appr = tf.multiply(gumbel_t, temperature)# one-hot-like, [batch_size x vocab_size]
+
+                gen_o = gen_o.write(i, logits)
+                gen_x = gen_x.write(i, next_token)
+                gen_x_onehot_adv = gen_x_onehot_adv.write(i, tf.nn.softmax(x_onehot_appr))
+                x_tp1 = tf.nn.embedding_lookup(self.embedding, next_token)
+                return i + 1, x_tp1, state, gen_o, gen_x, gen_x_onehot_adv
+            # build a graph for outputting sequential tokens
+
+            _, _ , _, self.gen_o, self.gen_x, self.gen_x_onehot_adv = control_flow_ops.while_loop(
+                cond=lambda i,_1,_2,_3,_4,_5: i < max_len,
+                body=_gen_recurrence,
+                loop_vars=(random_start_length + 1, tf.nn.embedding_lookup(self.embedding, decoder_inputs[:, random_start_length]),
+                           self.decoder_start_word_state, gen_o, gen_x, gen_x_onehot_adv))
+            self.gen_o = tf.transpose(self.gen_o.stack(), perm=[1, 0, 2])  # batch_size x seq_len x vocab_size
+            self.gen_x = tf.transpose(self.gen_x.stack(), perm=[1, 0])
+            self.gen_x_onehot_adv = tf.transpose(self.gen_x_onehot_adv.stack(), perm=[1, 0, 2])
+
+            temp_list = tf.constant(list(range(100)))
+            temp_list = temp_list[:max_len] -1
+            temp_list = tf.tile(tf.reshape(temp_list,[1,max_len]),[BATCH_SIZE,1])
+            self.ifequal = tf.equal(tf.to_int32(tf.argmax(self.gen_o,-1)),tf.ones_like(self.gen_x))
+            self.ifequal = tf.to_int32(self.ifequal[:,:-1])
+            self.ifequal = tf.concat([self.ifequal,tf.ones((BATCH_SIZE,1),tf.int32)],-1)
+            self.total_length = tf.multiply(tf.to_int32(self.ifequal),temp_list) + 10000 * (1-tf.to_int32(self.ifequal))
+            self.gen_x_length = tf.reduce_mean(tf.to_float(tf.reduce_min(self.total_length,-1)))
+
+
+    def init_vars(self, sess):
         init_op = tf.group(tf.global_variables_initializer(),
                            tf.local_variables_initializer())
         sess.run(init_op)
 
-
-    def get_batches(self, batch_size,set_no,padding_num = 0,feature_dict = dict()):
-        if set_no == 4:
-            total_text, song_names = get_corpus(if_segment=if_segment, set_no=1)
-            total_text = total_text[0:1000]
-            song_names = song_names[0:1000]
+    def pretrain_var_list(self,mean_loss = True):
+        if mean_loss:
+            return self.decoder_final_state, tf.reduce_mean(self.loss),tf.reduce_mean(self.original_loss)
         else:
-            total_text,song_names = get_corpus(if_segment= if_segment,set_no = set_no)
+            return self.decoder_final_state, tf.reduce_mean(self.loss,1),tf.reduce_mean(self.original_loss)
 
-        n_batches = (len(total_text) // (batch_size))
-        batches = []
-        length = []
-        features = []
-        songnames = []
+    def generate_var_list(self):
+        return self.gen_o, self.gen_x, self.gen_x_onehot_adv
 
-        if set_no != 4:# random.shuffle
-            total_length = len(total_text)
-            temp_rand_num = np.random.randint(1, 1000000, total_length)
-            temp_rank = np.argsort(temp_rand_num)#打乱
-            new_text = []
-            new_names = []
-            for i in temp_rank:
-                new_text.append(total_text[i])
-                new_names.append(song_names[i])
-            total_text = new_text
-            song_names = new_names
-        for text_i,text in enumerate(total_text):
-            for word_i,word in enumerate(text):
-                total_text[text_i][word_i] = self.ch2int[total_text[text_i][word_i]]
-        max_length = []
-        for batch_i in range(n_batches):
-            batch_length = []
-            for j in range(batch_size):
-                batch_length.append(len(total_text[batch_i * batch_size + j]))
-            max_length.append(max(batch_length))
-            length.append(batch_length)
+    def pretrain_logits(self):
+        return self.logits
+    def encoder_state_var(self):
+        return tf.reshape(tf.transpose(tf.convert_to_tensor(self.encoder_final_state),
+                                                     perm=[2, 0, 1, 3]),
+                                                   [BATCH_SIZE, mem_slots, -1])
+    def right_word_count(self):
+        return tf.reduce_mean(self.right_count),self.gen_x_length
 
-            for text_i,text in enumerate(total_text[batch_i*batch_size : (batch_i+1)*batch_size]):
-                text_length = len(text)
-                for zero_i in range(text_length ,max_length[batch_i]):
-                    total_text[batch_i * batch_size + text_i].append(self.ch2int['\end'])#调节为等长度，以便化为array
-            batches.append(np.array(total_text[batch_i * batch_size:(batch_i + 1) * (batch_size)]))
-
-            temp_feature = []
-            for j in range(batch_size):
-                temp_feature.append(feature_dict[song_names[batch_i * batch_size + j]])
-            features.append(temp_feature)
-            temp_name = []
-            for j in range(batch_size):
-                temp_name.append(song_names[batch_i * batch_size + j])
-            songnames.append(temp_name)
-        return batches,length,features,songnames
-
-    def get_target_batch(self,batch,length):
-        target_batch = batch.copy()
-        for i in range(BATCH_SIZE):
-            for j in range(length[i], batch.shape[-1]):
-                target_batch[i][j] = self.ch2int['\end']
-        return target_batch
-    def train(self,n_epochs = 100):
-        learn_rate = args.lr
-        decay_rate = args.decay_rate
-        replace_decay = args.replace_decay
-        last_valid_loss = 0
-        last_train_loss = 0
-
-        print("Start training RNN enc-dec model ...")
-        embedding = np.load(os.path.join(data_dir,'word2vec.npy'))
-        with tf.Session() as sess:
-            writer = tf.summary.FileWriter("logs/", sess.graph)
-            saver = tf.train.Saver()
-            self._init_vars(sess)
-            saved_global_step = load(saver, sess, save_dir)
-            if saved_global_step is None:
-                # The first training step will be saved_global_step + 1,
-                # therefore we put -1 here for new or overwritten trainings.
-                saved_global_step = -1
-            try:
-                feature_dict = get_audio_feature()
-                for epoch in range(saved_global_step + 1,n_epochs):
-                    log = open("log.txt", "a+")
-                    replace_prob = 1 - replace_decay ** epoch
-                    batches, length,features,_ = self.get_batches(batch_size=BATCH_SIZE, set_no=1,feature_dict=feature_dict)
-                    sess.run(tf.assign(self.learn_rate, learn_rate * decay_rate ** (epoch//5*5)))
-                    total_loss = 0
-                    temp_total_loss = 0
-                    for batch_i,batch in enumerate(batches):
-                        replaced_batch = self.replace(sess,batch,length[batch_i],replace_prob)
-                        target_batch = self.get_target_batch(batch,length[batch_i])
-                        feature_batch = features[batch_i]
-                        feature_batch, feature_length = prepare_feature_batch(feature_batch)
-                        outputs, loss,_ = sess.run([self.decoder_final_state, self.loss, self.train_op], feed_dict={
-                            self.encoder_inputs:feature_batch,
-                            self.encoder_lengths:feature_length,
-                            self.decoder_inputs:replaced_batch[:,:-1],
-                            self.targets: target_batch[:,1:],
-                            self.decoder_lengths:length[batch_i],
-                            self._embed_ph: embedding})
-                        total_loss += loss
-                        if batch_i  %  10 == 9:
-                            print('Epoch {:>3} Batch {:>4}/{}   train_loss = {:.3f} range_loss = {:.3f}'.format(
-                                epoch,
-                                batch_i + 1,
-                                len(batches),
-                                loss,
-                                total_loss - temp_total_loss))
-                            temp_total_loss = total_loss
-                    print('Epoch {:>3}   total_loss = {:.3f}({:.3f}),avg = {:.3f} lr = {:.5f} replace_prob = {:.3f}'.format(
-                        epoch,total_loss,total_loss - last_train_loss,total_loss / len(batches),sess.run(self.learn_rate),replace_prob))
-                    log.write('Epoch {:>3}   total_loss = {:.3f}({:.3f}),avg = {:.3f} lr = {:.5f} replace_prob = {:.3f}\n'.format(
-                        epoch,total_loss,total_loss - last_train_loss,total_loss/len(batches),sess.run(self.learn_rate),replace_prob))
-                    last_train_loss = total_loss
-                    print(time.ctime())
-                    log.write(time.ctime()+'\n')
-                    #valid
-                    last_valid_loss = self.valid(sess,embedding,log,last_valid_loss)
-                    #save
-                    if epoch % 5 == 0:
-                        save(saver, sess, save_dir, epoch)
-                        last_saved_epoch = epoch
-                        print('Model Trained and Saved')
-#                        self.generate(1)
-                    log.close()
-            except KeyboardInterrupt:
-                print("\nTraining is interrupted.")
-
-    def valid(self,sess,embedding,log,last_valid_loss):
-        total_valid_loss = 0
-        total_valid_times = 0
-        batches, length, features, _ = self.get_batches(BATCH_SIZE, set_no=2, feature_dict=get_audio_feature())
-        for batch_i, batch in enumerate(batches[0:50]):
-            feature_batch = features[batch_i]
-            feature_batch,feature_length = prepare_feature_batch(feature_batch)
-            target_batch = self.get_target_batch(batch, length[batch_i])
-            outputs, loss = sess.run([self.decoder_final_state, self.loss], feed_dict={
-                self.encoder_inputs: feature_batch,
-                self.encoder_lengths: feature_length,
-                self.decoder_inputs: batch[:, :-1],
-                self.targets: target_batch[:, 1:],
-                self.decoder_lengths: length[batch_i],
-                self._embed_ph: embedding})
-            total_valid_loss += loss
-            total_valid_times += 1
-        print('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}'.format(
-            total_valid_loss,total_valid_loss - last_valid_loss,total_valid_loss / total_valid_times))
-        log.write('Valid Total loss = {:.3f}({:.3f}),avg = {:.3f}\n'.format(
-            total_valid_loss,total_valid_loss - last_valid_loss,total_valid_loss / total_valid_times))
-        last_valid_loss = total_valid_loss
-        return last_valid_loss
-
-    def generate(self,num = None,start_word = 5,write_json = False):
-        embedding = np.load(os.path.join(data_dir, 'word2vec.npy'))
-        with tf.Session() as sess:
-            saver = tf.train.Saver()
-            self._init_vars(sess)
-            _ = load(saver, sess, save_dir)
-            batches,lengthes,features,songnames= self.get_batches(BATCH_SIZE , set_no=4,feature_dict = get_audio_feature())
-            if num!= None:
-                batches = batches[:num]
-                lengthes = lengthes[:num]
-            if write_json:
-                strings = dict()
-
-            for batch_i,batch in enumerate(batches):
-                total_length = np.max(lengthes[batch_i])#一个batch中的最大长度
-                prime_word = batch[:,0:start_word].tolist()
-                gen_sentence = []
-                song_names = []
-                gen_string = []
-                for i in range(BATCH_SIZE):
-                    gen_sentence.append([])
-                    song_names.append(songnames[batch_i][i])
-                    gen_sentence[i].extend(prime_word[i])
-                for length in range(start_word - 1, total_length):
-                    if length == start_word - 1:#initialize the state
-                        input_length = start_word * np.ones(BATCH_SIZE)
-                        feature_batch = features[batch_i]
-                        feature_batch,feature_length = prepare_feature_batch(feature_batch)
-
-                        prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                            self.encoder_inputs: feature_batch,
-                            self.encoder_lengths: feature_length,
-                            self.decoder_inputs: np.array(gen_sentence),
-                            self.decoder_lengths: input_length,
-                            self._embed_ph: embedding})
-                        continue
-                    else:
-                        input_length = np.ones(BATCH_SIZE)
-                        prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                            self.decoder_inputs: np.array(gen_sentence)[:,-1:],
-                            self.encoder_final_state: state,
-                            self.decoder_lengths: input_length,
-                            self._embed_ph: embedding})
-                    for i in range(BATCH_SIZE):#pick the word
-                        temp = prob[i,- 1].tolist()
-                        pre_word = pick_word(temp)
-                        gen_sentence[i].append(pre_word)
-                batch = batch.tolist()
-
-                for i in range(BATCH_SIZE):#为后面的输出batch做处理
-                    for word_i in range(total_length):
-                        batch[i][word_i] = self.int2ch[batch[i][word_i]]
-                        if batch[i][word_i] == '\end':
-                            batch[i] = batch[i][0:word_i + 1]
-                            break
-                for sentence in range(BATCH_SIZE):
-                    for word_i in range(total_length):
-                        gen_sentence[sentence][word_i] = self.int2ch[gen_sentence[sentence][word_i]]
-                        if gen_sentence[sentence][word_i] == '\end' or word_i == (total_length - 1):
-                            gen_sentence[sentence][-1] = '\end'
-                            print('生成的句子: ',end='')
-                            for word_ii in range(word_i + 1):
-                                if word_ii == start_word:
-                                    print('   ',end='')
-                                print(gen_sentence[sentence][word_ii],end='')
-                            gen_sentence[sentence] = gen_sentence[sentence][0:word_i + 1]
-                            string = ''.join(gen_sentence[sentence][0:word_i + 1])
-                            gen_string.append(string[1:-1])
-                            break
-                    print('')
-
-                    print('原来的句子: ', end='')
-                    for word_i,word in enumerate(batch[sentence]):
-                        if word_i == start_word:
-                            break
-                        print(word,end='')
-                    print('')
-
-
-                if write_json:
-                    for sen_i,sen in enumerate(gen_string):
-                        try:
-                            strings[songnames[batch_i][sen_i]].append(sen)
-                        except:
-                            strings[songnames[batch_i][sen_i]] = [sen]
-
-    def replace(self,sess,batch,batch_length,replace_prob): #Schedueld Sampling
-        if replace_prob < 1e-4:
-            return batch
-        embedding = np.load(os.path.join(data_dir, 'word2vec.npy'))
-        max_len = 0
-        for i in range(BATCH_SIZE):
-            if batch_length[i] > max_len:
-                max_len  = batch_length[i]
-#        state = sess.run(self.decoder_init_state)
-        for length in range(max_len):
-            if length < 5:
-                continue
-#            input_length = length * np.ones(BATCH_SIZE)
-            if length == 5:
-                input_length = 5 * np.ones(BATCH_SIZE)
-                prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                    self.encoder_init_state: state,
-                    self.decoder_inputs: batch[:, :length],
-                    self.decoder_lengths: input_length,
-                    self._embed_ph: embedding})
-            else:
-                input_length = np.ones(BATCH_SIZE)
-                prob, state = sess.run([self.probs, self.decoder_final_state], feed_dict={
-                    self.encoder_final_state:state,
-                    self.decoder_inputs: batch[:,-1:],
-                    self.decoder_lengths: input_length,
-                    self._embed_ph: embedding})
-            if random.random() < replace_prob:
-                for i in range(BATCH_SIZE):#不替换padding
-                    temp = prob[i, -1].tolist()
-                    pre_word = pick_word(temp)
-                    if i<batch_length[i]:
-                        batch[i,length] = pre_word
-                    else:
-                        continue
-            else:
-                continue
-        return batch
-
-
-# 不知道为什么作为class Generator 的函数就会出错..
-def pick_word(probabilities):#return int
-    probabilities[3]/=2# \end have less prob
-    candidate = np.argsort(probabilities)[-5:]
-    new_prob = []
-    for ch in candidate:
-#        if probabilities[ch] > 0.05:
-        new_prob.append(probabilities[ch])
-    sums = np.sum(np.array(new_prob))
-    for i in range(len(new_prob)):
-        new_prob[i] /= sums
-    random_num = random.random()
-    for i in range(new_prob.__len__()):
-        random_num -= new_prob[i]
-        if random_num < 0:
-            ch = candidate[i]
-            break
-    if len(candidate) == 0:
-        ch = np.argmax(probabilities)
-#    if self.ch2int(ch) ==
-    return ch
-
-def save(saver, sess, logdir, step):
-    model_name = 'model.ckpt'
-    checkpoint_path = os.path.join(logdir, model_name)
-    print('Storing checkpoint to {} ...'.format(logdir), end="")
-    sys.stdout.flush()
-    if not os.path.exists(logdir):
-        os.makedirs(logdir)
-    saver.save(sess, checkpoint_path, global_step=step)
-    print(' Done.')
-
-def load(saver, sess, logdir):
-    print("Trying to restore saved checkpoints from {} ...".format(logdir),
-          end="")
-
-    ckpt = tf.train.get_checkpoint_state(logdir)
-    if ckpt:
-        print("  Checkpoint found: {}".format(ckpt.model_checkpoint_path))
-        global_step = int(ckpt.model_checkpoint_path
-                          .split('/')[-1]
-                          .split('-')[-1])
-        print("  Global step was: {}".format(global_step))
-        print("  Restoring...", end="")
-        saver.restore(sess, ckpt.model_checkpoint_path)
-        print(" Done.")
-        return global_step
-    else:
-        print(" No checkpoint found.")
-        return None
-
-def prepare_feature_batch(feature_batch):
+    def VAE_variable(self):
+        return self.mn,self.sd
+def prepare_feature_batch(feature_batch, songnames=None, feature_dict=None):
     feature_length = []
+    BATCH_SIZE = len(feature_batch)
     for i in range(BATCH_SIZE):
-        temp_length = feature_batch[i].shape[0] // (_NUM_UNITS * 10) * (_NUM_UNITS * 10)
-        feature_batch[i] = np.reshape(feature_batch[i][:temp_length], [10, -1, _NUM_UNITS])
-        feature_batch[i] = np.mean(feature_batch[i], 0)
+        feature_batch[i] = np.reshape(feature_batch[i][:], [-1])
+        temp_length = feature_batch[i].shape[0] // (_NUM_UNITS) * (_NUM_UNITS)
+        feature_batch[i] = np.reshape(feature_batch[i][:temp_length*_NUM_UNITS], [-1, _NUM_UNITS])
         feature_length.append(feature_batch[i].shape[0])
     temp_max_length = np.max(feature_length)
     temp_feature_batch = np.zeros([BATCH_SIZE, temp_max_length, _NUM_UNITS])
@@ -493,13 +365,32 @@ def prepare_feature_batch(feature_batch):
         temp_feature_batch[i, 0:feature_batch[i].shape[0], :] = feature_batch[i]
     feature_batch = temp_feature_batch
     feature_length = np.array(feature_length)
-    return feature_batch,feature_length
 
-if __name__ == '__main__':
-    args = get_arguments()
-    _NUM_LAYERS = args.num_layer
-    BATCH_SIZE = args.batch_size
-    generator = Generator()
-    n_epoch = args.n_epoch
-    generator.train(n_epoch)
-#    generator.generate(1)
+    song_names_dict = dict()
+    song_name_list = list(feature_dict.keys())
+    for songidx,song_name in enumerate(song_name_list):
+        song_names_dict[song_name] = songidx
+    song_name_labels = []
+    for i in range(BATCH_SIZE):
+        song_name_labels.append(song_names_dict[songnames[i]])
+    song_name_labels = np.array(song_name_labels)
+    return feature_batch,feature_length,song_name_labels
+
+def prepare_lyric_batch(lyric_batch,ch2int):
+    lyric_length = []
+    temp_lyric_batch  = []
+    for i in range(BATCH_SIZE):
+        temp_length = len(lyric_batch[i])
+        lyric_length.append(temp_length)
+        temp_lyric_batch.append([])
+    temp_max_length = np.max(lyric_length)
+    temp_lyric_batch = np.zeros([BATCH_SIZE, temp_max_length], dtype=np.int32)
+    for i in range(BATCH_SIZE):
+        for j in range(lyric_length[i]):
+            try:
+                temp_lyric_batch[i][j] = ch2int[lyric_batch[i][j]]
+            except:
+                pass
+    lyric_length = np.array(lyric_length)
+    return temp_lyric_batch,lyric_length
+
